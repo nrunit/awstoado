@@ -112,7 +112,7 @@ function createMcpServer(): McpServer {
       const wiql = `
         SELECT [System.Id], [System.Title], [System.State], [System.WorkItemType], [System.TeamProject]
         FROM WorkItems
-        WHERE [System.TeamProject] = '${project}'
+        WHERE [System.TeamProject] = '${ADO_PROJECT}'
         ${textFilter}
         ORDER BY [System.ChangedDate] DESC
       `;
