@@ -13,12 +13,26 @@ const ADO_PROJECT = required("ADO_PROJECT");
 const ADO_PAT = required("ADO_PAT");
 const ADO_API_VERSION = process.env.ADO_API_VERSION ?? "7.1";
 
+const WORK_ITEM_TYPES = [
+  "Epic",
+  "Feature",
+  "Product Backlog Item",
+  "Task",
+  "Bug",
+] as const;
+
+type WorkItemType = (typeof WORK_ITEM_TYPES)[number];
+
 function required(name: string): string {
   const value = process.env[name];
   if (!value || value.trim() === "") {
     throw new Error(`Missing required environment variable: ${name}`);
   }
   return value;
+}
+
+function escapeWiql(value: string): string {
+  return value.replaceAll("'", "''");
 }
 
 function mcpText(value: unknown) {
@@ -83,37 +97,73 @@ function workItemPatch(fields: Record<string, unknown>) {
     }));
 }
 
+async function getWorkItemDetails(ids: number[]) {
+  if (ids.length === 0) {
+    return { workItems: [] };
+  }
+
+  return adoRequest<Record<string, unknown>>(
+    `/_apis/wit/workitems?ids=${ids.join(",")}&$expand=fields&api-version=${ADO_API_VERSION}`
+  );
+}
+
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "minimal-aws-quick-ado-mcp",
-    version: "0.1.0",
+    version: "0.2.0",
   });
 
-    server.registerTool(
+  server.registerTool(
     "ado_search_work_items",
     {
       title: "Search Azure DevOps work items",
-      description: "Searches Azure DevOps work items only in the configured ADO project.",
+      description:
+        "Searches Azure DevOps work items only in the configured ADO project. Supports Epic, Feature, Product Backlog Item, Task, and Bug.",
       inputSchema: {
         searchText: z.string().optional(),
+        workItemTypes: z
+          .array(z.enum(WORK_ITEM_TYPES))
+          .optional()
+          .describe("Optional filter for work item levels/types."),
+        state: z.string().optional().describe("Optional state filter, for example Active, New, Resolved, Closed."),
         top: z.number().int().min(1).max(50).default(10),
       },
     },
-    async ({ searchText, top }) => {
-      const project = ADO_PROJECT.replaceAll("'", "''");
+    async ({ searchText, workItemTypes, state, top }) => {
+      const project = escapeWiql(ADO_PROJECT);
+
+      const selectedTypes =
+        workItemTypes && workItemTypes.length > 0
+          ? workItemTypes
+          : [...WORK_ITEM_TYPES];
+
+      const typeFilter = selectedTypes
+        .map((type) => `'${escapeWiql(type)}'`)
+        .join(", ");
 
       const textFilter = searchText
         ? `AND (
-            [System.Title] CONTAINS '${searchText.replaceAll("'", "''")}'
-            OR [System.Description] CONTAINS '${searchText.replaceAll("'", "''")}'
+            [System.Title] CONTAINS '${escapeWiql(searchText)}'
+            OR [System.Description] CONTAINS '${escapeWiql(searchText)}'
           )`
         : "";
 
+      const stateFilter = state
+        ? `AND [System.State] = '${escapeWiql(state)}'`
+        : "";
+
       const wiql = `
-        SELECT [System.Id], [System.Title], [System.State], [System.WorkItemType], [System.TeamProject]
+        SELECT
+          [System.Id],
+          [System.Title],
+          [System.State],
+          [System.WorkItemType],
+          [System.TeamProject]
         FROM WorkItems
-        WHERE [System.TeamProject] = '${ADO_PROJECT}'
-        ${textFilter}
+        WHERE [System.TeamProject] = '${project}'
+          AND [System.WorkItemType] IN (${typeFilter})
+          ${stateFilter}
+          ${textFilter}
         ORDER BY [System.ChangedDate] DESC
       `;
 
@@ -127,16 +177,28 @@ function createMcpServer(): McpServer {
       );
 
       const refs = (result.workItems as Array<{ id: number }> | undefined) ?? [];
-      if (refs.length === 0) {
-        return mcpText({ workItems: [] });
-      }
+      const ids = refs.map((item) => item.id);
 
-      const ids = refs.map((item) => item.id).join(",");
-      const details = await adoRequest<Record<string, unknown>>(
-        `/_apis/wit/workitems?ids=${ids}&$expand=fields&api-version=${ADO_API_VERSION}`
+      const details = await getWorkItemDetails(ids);
+      return mcpText(details);
+    }
+  );
+
+  server.registerTool(
+    "ado_get_work_item",
+    {
+      title: "Get Azure DevOps work item",
+      description: "Gets an Azure DevOps work item by ID. Works for Epic, Feature, Product Backlog Item, Task, and Bug.",
+      inputSchema: {
+        id: z.number().int().positive(),
+      },
+    },
+    async ({ id }) => {
+      const result = await adoRequest<Record<string, unknown>>(
+        `/_apis/wit/workitems/${id}?$expand=all&api-version=${ADO_API_VERSION}`
       );
 
-      return mcpText(details);
+      return mcpText(result);
     }
   );
 
@@ -144,9 +206,10 @@ function createMcpServer(): McpServer {
     "ado_create_work_item",
     {
       title: "Create Azure DevOps work item",
-      description: "Creates a basic Azure DevOps work item.",
+      description:
+        "Creates an Azure DevOps work item at any supported tracking level: Epic, Feature, Product Backlog Item, Task, or Bug.",
       inputSchema: {
-        type: z.enum(["Bug", "Task", "User Story", "Feature", "Issue"]).default("Task"),
+        type: z.enum(WORK_ITEM_TYPES).default("Product Backlog Item"),
         title: z.string().min(1),
         description: z.string().optional(),
         assignedTo: z.string().optional(),
@@ -177,10 +240,50 @@ function createMcpServer(): McpServer {
   );
 
   server.registerTool(
+    "ado_update_work_item",
+    {
+      title: "Update Azure DevOps work item",
+      description:
+        "Updates an existing Azure DevOps work item. Works for Epic, Feature, Product Backlog Item, Task, and Bug.",
+      inputSchema: {
+        id: z.number().int().positive(),
+        title: z.string().optional(),
+        description: z.string().optional(),
+        assignedTo: z.string().optional(),
+        tags: z.string().optional(),
+        priority: z.number().int().min(1).max(4).optional(),
+        state: z.string().optional(),
+      },
+    },
+    async ({ id, title, description, assignedTo, tags, priority, state }) => {
+      const fields: Record<string, unknown> = {
+        "System.Title": title,
+        "System.Description": description,
+        "System.AssignedTo": assignedTo,
+        "System.Tags": tags,
+        "Microsoft.VSTS.Common.Priority": priority,
+        "System.State": state,
+      };
+
+      const result = await adoRequest<Record<string, unknown>>(
+        `/_apis/wit/workitems/${id}?api-version=${ADO_API_VERSION}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json-patch+json" },
+          body: JSON.stringify(workItemPatch(fields)),
+        }
+      );
+
+      return mcpText(result);
+    }
+  );
+
+  server.registerTool(
     "ado_add_comment",
     {
       title: "Add comment to Azure DevOps work item",
-      description: "Adds a comment to an existing Azure DevOps work item.",
+      description:
+        "Adds a comment to an existing Azure DevOps work item. Works for Epic, Feature, Product Backlog Item, Task, and Bug.",
       inputSchema: {
         id: z.number().int().positive(),
         comment: z.string().min(1),
