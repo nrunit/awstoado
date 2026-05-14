@@ -89,19 +89,34 @@ function createMcpServer(): McpServer {
     version: "0.1.0",
   });
 
-  server.registerTool(
+    server.registerTool(
     "ado_search_work_items",
     {
       title: "Search Azure DevOps work items",
-      description: "Searches Azure DevOps work items with WIQL.",
+      description: "Searches Azure DevOps work items only in the configured ADO project.",
       inputSchema: {
-        wiql: z.string().min(1).default(
-          "SELECT [System.Id], [System.Title], [System.State], [System.WorkItemType] FROM WorkItems WHERE [System.TeamProject] = @project ORDER BY [System.ChangedDate] DESC"
-        ),
+        searchText: z.string().optional(),
         top: z.number().int().min(1).max(50).default(10),
       },
     },
-    async ({ wiql, top }) => {
+    async ({ searchText, top }) => {
+      const project = ADO_PROJECT.replaceAll("'", "''");
+
+      const textFilter = searchText
+        ? `AND (
+            [System.Title] CONTAINS '${searchText.replaceAll("'", "''")}'
+            OR [System.Description] CONTAINS '${searchText.replaceAll("'", "''")}'
+          )`
+        : "";
+
+      const wiql = `
+        SELECT [System.Id], [System.Title], [System.State], [System.WorkItemType], [System.TeamProject]
+        FROM WorkItems
+        WHERE [System.TeamProject] = '${project}'
+        ${textFilter}
+        ORDER BY [System.ChangedDate] DESC
+      `;
+
       const result = await adoRequest<Record<string, unknown>>(
         `/_apis/wit/wiql?$top=${top}&api-version=${ADO_API_VERSION}`,
         {
