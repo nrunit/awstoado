@@ -126,7 +126,7 @@ function createMcpServer(): McpServer {
           .optional()
           .describe("Optional filter for work item levels/types."),
         state: z.string().optional().describe("Optional state filter, for example Active, New, Resolved, Closed."),
-        top: z.number().int().min(1).max(50).default(10),
+        top: z.number().int().min(1).max(200).default(50),
       },
     },
     async ({ searchText, workItemTypes, state, top }) => {
