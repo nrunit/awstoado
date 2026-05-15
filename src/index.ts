@@ -455,6 +455,89 @@ function createMcpServer(): McpServer {
     }
   );
 
+  server.registerTool(
+    "ado_get_completed_work_report",
+    {
+      title: "Get Azure DevOps completed work report",
+      description:
+        "Gets work items completed during a date range, regardless of their current iteration path. Use this for sprint reports based on completion date rather than current iteration assignment.",
+      inputSchema: {
+        startDate: z
+          .string()
+          .min(1)
+          .describe("Start date/time for completed work, for example 2026-05-04T00:00:00Z."),
+        endDate: z
+          .string()
+          .min(1)
+          .describe("End date/time for completed work, for example 2026-05-16T00:00:00Z."),
+        assignedTo: z
+          .string()
+          .optional()
+          .describe("Optional assignee filter, for example Shelby Baker."),
+        workItemTypes: z
+          .array(z.enum(WORK_ITEM_TYPES))
+          .optional()
+          .describe("Optional filter for work item levels/types."),
+        top: z.number().int().min(1).max(200).default(100),
+      },
+    },
+    async ({ startDate, endDate, assignedTo, workItemTypes, top }) => {
+      const project = escapeWiql(ADO_PROJECT);
+
+      const selectedTypes =
+        workItemTypes && workItemTypes.length > 0
+          ? workItemTypes
+          : [...WORK_ITEM_TYPES];
+
+      const typeFilter = selectedTypes
+        .map((type) => `'${escapeWiql(type)}'`)
+        .join(", ");
+
+      const assignedToFilter = assignedTo
+        ? `AND [System.AssignedTo] CONTAINS '${escapeWiql(assignedTo)}'`
+        : "";
+
+      const wiql = `
+        SELECT
+          [System.Id],
+          [System.Title],
+          [System.WorkItemType],
+          [System.State],
+          [System.AssignedTo],
+          [System.IterationPath],
+          [System.ChangedDate],
+          [Microsoft.VSTS.Common.ClosedDate],
+          [Microsoft.VSTS.Scheduling.OriginalEstimate],
+          [Microsoft.VSTS.Scheduling.RemainingWork],
+          [Microsoft.VSTS.Scheduling.CompletedWork],
+          [Microsoft.VSTS.Scheduling.StoryPoints],
+          [Microsoft.VSTS.Scheduling.Effort]
+        FROM WorkItems
+        WHERE [System.TeamProject] = '${project}'
+          AND [System.WorkItemType] IN (${typeFilter})
+          AND [Microsoft.VSTS.Common.ClosedDate] >= '${escapeWiql(startDate)}'
+          AND [Microsoft.VSTS.Common.ClosedDate] < '${escapeWiql(endDate)}'
+          ${assignedToFilter}
+        ORDER BY [Microsoft.VSTS.Common.ClosedDate] DESC
+      `;
+
+      const result = await adoRequest<Record<string, unknown>>(
+        `/_apis/wit/wiql?$top=${top}&api-version=${ADO_API_VERSION}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: wiql }),
+        }
+      );
+
+      const refs = (result.workItems as Array<{ id: number }> | undefined) ?? [];
+      const ids = refs.map((item) => item.id);
+
+      const details = await getWorkItemDetails(ids);
+      return mcpText(details);
+    }
+  );
+
   return server;
 }
 
