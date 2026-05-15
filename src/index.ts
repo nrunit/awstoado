@@ -21,8 +21,6 @@ const WORK_ITEM_TYPES = [
   "Bug",
 ] as const;
 
-type WorkItemType = (typeof WORK_ITEM_TYPES)[number];
-
 function required(name: string): string {
   const value = process.env[name];
   if (!value || value.trim() === "") {
@@ -110,7 +108,7 @@ async function getWorkItemDetails(ids: number[]) {
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "minimal-aws-quick-ado-mcp",
-    version: "0.2.0",
+    version: "0.3.0",
   });
 
   server.registerTool(
@@ -125,7 +123,10 @@ function createMcpServer(): McpServer {
           .array(z.enum(WORK_ITEM_TYPES))
           .optional()
           .describe("Optional filter for work item levels/types."),
-        state: z.string().optional().describe("Optional state filter, for example Active, New, Resolved, Closed."),
+        state: z
+          .string()
+          .optional()
+          .describe("Optional state filter, for example New, Active, Resolved, Closed, Done."),
         top: z.number().int().min(1).max(200).default(50),
       },
     },
@@ -158,7 +159,10 @@ function createMcpServer(): McpServer {
           [System.Title],
           [System.State],
           [System.WorkItemType],
-          [System.TeamProject]
+          [System.TeamProject],
+          [System.AssignedTo],
+          [System.IterationPath],
+          [System.ChangedDate]
         FROM WorkItems
         WHERE [System.TeamProject] = '${project}'
           AND [System.WorkItemType] IN (${typeFilter})
@@ -185,10 +189,89 @@ function createMcpServer(): McpServer {
   );
 
   server.registerTool(
+    "ado_get_iteration_report",
+    {
+      title: "Get Azure DevOps iteration report",
+      description:
+        "Gets work items in a specific Azure DevOps iteration, including owner, current state, estimates, remaining work, completed work, story points, effort, and changed date. Supports Epic, Feature, Product Backlog Item, Task, and Bug.",
+      inputSchema: {
+        iterationPath: z
+          .string()
+          .min(1)
+          .describe("Exact Azure DevOps iteration path, for example ProjectName\\2026\\0504 - 0515."),
+        changedSince: z
+          .string()
+          .optional()
+          .describe("Optional ISO date filter, for example 2026-05-04T00:00:00Z."),
+        workItemTypes: z
+          .array(z.enum(WORK_ITEM_TYPES))
+          .optional()
+          .describe("Optional filter for work item levels/types."),
+        top: z.number().int().min(1).max(200).default(100),
+      },
+    },
+    async ({ iterationPath, changedSince, workItemTypes, top }) => {
+      const project = escapeWiql(ADO_PROJECT);
+      const iteration = escapeWiql(iterationPath);
+
+      const selectedTypes =
+        workItemTypes && workItemTypes.length > 0
+          ? workItemTypes
+          : [...WORK_ITEM_TYPES];
+
+      const typeFilter = selectedTypes
+        .map((type) => `'${escapeWiql(type)}'`)
+        .join(", ");
+
+      const changedFilter = changedSince
+        ? `AND [System.ChangedDate] >= '${escapeWiql(changedSince)}'`
+        : "";
+
+      const wiql = `
+        SELECT
+          [System.Id],
+          [System.Title],
+          [System.WorkItemType],
+          [System.State],
+          [System.AssignedTo],
+          [System.IterationPath],
+          [System.ChangedDate],
+          [Microsoft.VSTS.Scheduling.OriginalEstimate],
+          [Microsoft.VSTS.Scheduling.RemainingWork],
+          [Microsoft.VSTS.Scheduling.CompletedWork],
+          [Microsoft.VSTS.Scheduling.StoryPoints],
+          [Microsoft.VSTS.Scheduling.Effort]
+        FROM WorkItems
+        WHERE [System.TeamProject] = '${project}'
+          AND [System.IterationPath] = '${iteration}'
+          AND [System.WorkItemType] IN (${typeFilter})
+          ${changedFilter}
+        ORDER BY [System.WorkItemType], [System.State], [System.AssignedTo]
+      `;
+
+      const result = await adoRequest<Record<string, unknown>>(
+        `/_apis/wit/wiql?$top=${top}&api-version=${ADO_API_VERSION}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: wiql }),
+        }
+      );
+
+      const refs = (result.workItems as Array<{ id: number }> | undefined) ?? [];
+      const ids = refs.map((item) => item.id);
+
+      const details = await getWorkItemDetails(ids);
+      return mcpText(details);
+    }
+  );
+
+  server.registerTool(
     "ado_get_work_item",
     {
       title: "Get Azure DevOps work item",
-      description: "Gets an Azure DevOps work item by ID. Works for Epic, Feature, Product Backlog Item, Task, and Bug.",
+      description:
+        "Gets a single Azure DevOps work item by ID. Works for Epic, Feature, Product Backlog Item, Task, and Bug.",
       inputSchema: {
         id: z.number().int().positive(),
       },
@@ -199,6 +282,73 @@ function createMcpServer(): McpServer {
       );
 
       return mcpText(result);
+    }
+  );
+
+  server.registerTool(
+    "ado_get_work_item_history",
+    {
+      title: "Get Azure DevOps work item history",
+      description:
+        "Gets Azure DevOps update/history records for a work item. Use this to inspect who changed fields such as iteration path and when.",
+      inputSchema: {
+        id: z.number().int().positive(),
+        top: z.number().int().min(1).max(200).default(100),
+      },
+    },
+    async ({ id, top }) => {
+      const result = await adoRequest<Record<string, unknown>>(
+        `/_apis/wit/workItems/${id}/updates?$top=${top}&api-version=${ADO_API_VERSION}`
+      );
+
+      return mcpText(result);
+    }
+  );
+
+  server.registerTool(
+    "ado_find_iteration_changes",
+    {
+      title: "Find Azure DevOps iteration changes",
+      description:
+        "Gets work item update/history records and returns the updates where System.IterationPath changed. Use this to find when an item was moved into or out of an iteration and who changed it.",
+      inputSchema: {
+        id: z.number().int().positive(),
+        top: z.number().int().min(1).max(200).default(100),
+      },
+    },
+    async ({ id, top }) => {
+      const updates = await adoRequest<Record<string, unknown>>(
+        `/_apis/wit/workItems/${id}/updates?$top=${top}&api-version=${ADO_API_VERSION}`
+      );
+
+      const values = (updates.value as Array<Record<string, unknown>> | undefined) ?? [];
+
+      const iterationChanges = values
+        .map((update) => {
+          const fields = update.fields as Record<string, unknown> | undefined;
+          const iterationField = fields?.["System.IterationPath"] as
+            | { oldValue?: unknown; newValue?: unknown }
+            | undefined;
+
+          if (!iterationField) {
+            return null;
+          }
+
+          return {
+            id: update.id,
+            revisedDate: update.revisedDate,
+            revisedBy: update.revisedBy,
+            oldIterationPath: iterationField.oldValue,
+            newIterationPath: iterationField.newValue,
+            url: update.url,
+          };
+        })
+        .filter(Boolean);
+
+      return mcpText({
+        workItemId: id,
+        iterationChanges,
+      });
     }
   );
 
@@ -253,9 +403,10 @@ function createMcpServer(): McpServer {
         tags: z.string().optional(),
         priority: z.number().int().min(1).max(4).optional(),
         state: z.string().optional(),
+        iterationPath: z.string().optional(),
       },
     },
-    async ({ id, title, description, assignedTo, tags, priority, state }) => {
+    async ({ id, title, description, assignedTo, tags, priority, state, iterationPath }) => {
       const fields: Record<string, unknown> = {
         "System.Title": title,
         "System.Description": description,
@@ -263,6 +414,7 @@ function createMcpServer(): McpServer {
         "System.Tags": tags,
         "Microsoft.VSTS.Common.Priority": priority,
         "System.State": state,
+        "System.IterationPath": iterationPath,
       };
 
       const result = await adoRequest<Record<string, unknown>>(
